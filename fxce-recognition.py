@@ -1,5 +1,5 @@
 from fastai.vision.all import *
-import face_recognition
+import torch.nn.functional as F
 import requests
 from PIL import Image
 from io import BytesIO
@@ -12,10 +12,43 @@ class FaceMatcher:
     def __init__(self, model_path: str = 'face_model.pkl'):
         self.model_path = model_path
         self.learn = None
-        self.face_encodings_cache = {}
+        self.image_embeddings = {}  # Cache for image embeddings
 
-    def train_model(self, training_path: str):
+    def _get_embedding(self, image_path: str) -> torch.Tensor:
+        """Get embedding vector for an image using ResNet34"""
+        if image_path in self.image_embeddings:
+            return self.image_embeddings[image_path]
+        
+        # Load and preprocess image
+        if image_path.startswith('http'):
+            response = requests.get(image_path)
+            img = PILImage.create(BytesIO(response.content))
+        else:
+            img = PILImage.create(image_path)
+        
+        # Get embedding using the model
+        self.learn.model.eval()
+        with torch.no_grad():
+            embedding = self.learn.model[:-1](self.learn.preprocess(img).unsqueeze(0))
+            embedding = F.normalize(embedding, p=2, dim=1)  # L2 normalize
+            
+        embedding = embedding.squeeze().cpu()
+        self.image_embeddings[image_path] = embedding
+        return embedding
+
+    def train_model(self, training_path: str, force_retrain: bool = False):
         """Train the FastAI model on a directory of images"""
+        # Check if model already exists
+        if os.path.exists(self.model_path) and not force_retrain:
+            print("Loading existing model...")
+            try:
+                self.learn = load_learner(self.model_path)
+                return
+            except Exception as e:
+                print(f"Error loading existing model: {e}")
+                print("Will retrain model...")
+
+        print("Training new model...")
         path = Path(training_path)
         dls = ImageDataLoaders.from_folder(path, valid_pct=0.2, 
                                          item_tfms=Resize(224))
@@ -23,50 +56,34 @@ class FaceMatcher:
         self.learn.fine_tune(3)
         self.learn.export(self.model_path)
 
-    def get_face_encoding(self, image_path: str) -> Optional[np.ndarray]:
-        """Get face encoding from an image"""
-        if image_path in self.face_encodings_cache:
-            return self.face_encodings_cache[image_path]
-
-        # Load image
-        if image_path.startswith('http'):
-            response = requests.get(image_path)
-            img = face_recognition.load_image_file(BytesIO(response.content))
-        else:
-            img = face_recognition.load_image_file(image_path)
-
-        # Get face encoding
-        face_encodings = face_recognition.face_encodings(img)
-        if not face_encodings:
-            return None
-        
-        encoding = face_encodings[0]
-        self.face_encodings_cache[image_path] = encoding
-        return encoding
+    
 
     def find_similar_faces(self, 
                           target_image_path: str,
                           candidate_images: List[str],
                           num_results: int = 50,
-                          similarity_threshold: float = 0.6) -> List[Tuple[str, float]]:
+                          similarity_threshold: float = 0.5) -> List[Tuple[str, float]]:
         """
-        Find similar faces in candidate images compared to target image
+        Find similar faces using ResNet34 embeddings
         Returns: List of tuples (image_path, similarity_score)
         """
-        target_encoding = self.get_face_encoding(target_image_path)
-        if target_encoding is None:
-            raise ValueError("No face found in target image")
+        if self.learn is None:
+            raise ValueError("Model not trained. Call train_model first.")
 
+        target_embedding = self._get_embedding(target_image_path)
+        
         results = []
         for img_path in candidate_images:
-            encoding = self.get_face_encoding(img_path)
-            if encoding is not None:
-                # Calculate face distance (lower = more similar)
-                face_distance = face_recognition.face_distance([target_encoding], encoding)[0]
-                # Convert distance to similarity score (higher = more similar)
-                similarity = 1 - face_distance
+            try:
+                embedding = self._get_embedding(img_path)
+                # Calculate cosine similarity
+                similarity = F.cosine_similarity(target_embedding.unsqueeze(0), 
+                                              embedding.unsqueeze(0)).item()
                 if similarity >= similarity_threshold:
                     results.append((img_path, similarity))
+            except Exception as e:
+                print(f"Error processing {img_path}: {str(e)}")
+                continue
 
         # Sort by similarity score and return top matches
         results.sort(key=lambda x: x[1], reverse=True)
@@ -75,9 +92,13 @@ class FaceMatcher:
 # Example usage:
 def main():
     matcher = FaceMatcher()
-
     
-    # Get all PNG files from the facx directory
+    # Train the model using images from facx directory
+    print("Training model on facx directory images...")
+    matcher.train_model('facx')
+    print("Training completed!")
+
+    # Get all JPG files from the facx directory
     facx_dir = Path('facx')
     candidate_images = list(facx_dir.glob('*.jpg'))
     candidate_images = [str(path) for path in candidate_images]
